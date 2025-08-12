@@ -20,15 +20,14 @@ export ARTIFACT_BUCKET=<an-existing-artifacts-bucket>
 
 # 2) Deploy infrastructure (creates API, Lambda, S3, CloudFront, etc.)
 aws cloudformation deploy \
-  --template-file infra/template.yaml \
+  --template-file stack.yml \
   --stack-name talking-avatar \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
     ProjectName=talking-avatar \
     ArtifactBucket=$ARTIFACT_BUCKET \
     LambdaArtifactKey=backend/lambda.zip \
-    PollyVoice=Joanna \
-    AwsRegion=ap-southeast-2
+    PollyVoice=Joanna
 
 # 3) Get outputs
 aws cloudformation describe-stacks --stack-name talking-avatar \
