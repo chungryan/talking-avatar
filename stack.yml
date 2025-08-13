@@ -48,10 +48,72 @@ Resources:
           POLLY_VOICE: !Ref PollyVoice
       Policies:
         - Statement:
-            - Effect: Allow
-              Action:
-                - polly:SynthesizeSpeech
-              Resource: "*"
+          - Effect: Allow
+            Action:
+              - polly:SynthesizeSpeech
+            Resource: "*"
+
+  UploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-upload-url
+      Runtime: provided.al2023
+      Handler: upload-url
+      CodeUri: backend/build/
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /upload-url
+            Method: POST
+            RestApiId:
+              Ref: Endpoints
+      Environment:
+        Variables:
+          ASSETS_BUCKET: !Ref AssetsBucket
+      Policies:
+        - Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource: !Sub ${AssetsBucket.Arn}/*
+
+  AvatarFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-avatar
+      Runtime: provided.al2023
+      Handler: avatar
+      CodeUri: backend/build/
+      Timeout: 60
+      MemorySize: 512
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /avatar
+            Method: POST
+            RestApiId:
+              Ref: Endpoints
+      Environment:
+        Variables:
+          ASSETS_BUCKET: !Ref AssetsBucket
+          BEDROCK_REGION: us-east-1
+          IMAGE_MODEL_ID: amazon.titan-image-generator-v1
+      Policies:
+        - Statement:
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              - !Sub arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-image-generator-v1
+        - Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub ${AssetsBucket.Arn}/*
 
   # -------------------- API Gateway (HTTP API) --------------------
 
@@ -83,8 +145,69 @@ Resources:
                 type: aws_proxy
                 uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatFunction.Arn}/invocations
               responses: {}
+          /upload-url:
+            post:
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadUrlFunction.Arn}/invocations
+              responses: {}
+          /avatar:
+            post:
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AvatarFunction.Arn}/invocations
+              responses: {}
+
+  # -------------------- S3 bucket for assets --------------------
+
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${AWS::AccountId}-assets
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, PUT, HEAD]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            ExposedHeaders: ['ETag']
+            MaxAge: 3000
+
+  AssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AssetsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceTLSONLY
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub ${AssetsBucket.Arn}
+              - !Sub ${AssetsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
 
   # -------------------- S3 bucket for SPA --------------------
+
   WebsiteBucket:
     Type: AWS::S3::Bucket
     Properties:

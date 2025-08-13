@@ -12,7 +12,8 @@
     "noEmit": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "strict": true
+    "strict": true,
+    "types": ["vite/client"]
   },
   "include": ["src"]
 }

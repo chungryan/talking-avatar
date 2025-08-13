@@ -8,6 +8,10 @@ import (
 
 func Ok(v any) (events.APIGatewayProxyResponse, error) {
 	b, _ := json.Marshal(v)
+	return OkString(string(b))
+}
+
+func OkString(b string) (events.APIGatewayProxyResponse, error) {
 	return events.APIGatewayProxyResponse{
 		StatusCode: 200,
 		Headers: map[string]string{
@@ -16,7 +20,7 @@ func Ok(v any) (events.APIGatewayProxyResponse, error) {
 			"Access-Control-Allow-Headers": "Content-Type,Authorization,X-Requested-With",
 			"Access-Control-Allow-Methods": "GET,POST,OPTIONS",
 		},
-		Body: string(b),
+		Body: b,
 	}, nil
 }
 
