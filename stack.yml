@@ -1,106 +1,82 @@
-AWSTemplateFormatVersion: '2010-09-09'
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
 Description: Talking Avatar – S3+CloudFront (SPA) + API Gateway HTTP API + Go Lambda (Polly)
 
 Parameters:
   ProjectName:
     Type: String
     Default: talking-avatar
-  ArtifactBucket:
-    Type: String
-    Description: Existing S3 bucket that contains the Lambda artifact zip
-  LambdaArtifactKey:
-    Type: String
-    Default: backend/lambda.zip
   PollyVoice:
     Type: String
     Default: Joanna
 
 Resources:
-  # -------------------- Lambda Role --------------------
-  LambdaRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub ${ProjectName}-lambda-role
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: polly-access
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: polly:SynthesizeSpeech
-                Resource: '*'
-
   # -------------------- Lambda Function --------------------
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-health
+      Runtime: provided.al2023
+      Handler: health
+      CodeUri: backend/build/
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /health
+            Method: GET
+            RestApiId:
+              Ref: Endpoints
+
   ChatFunction:
-    Type: AWS::Lambda::Function
+    Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub ${ProjectName}-chat
-      Role: !GetAtt LambdaRole.Arn
-      Runtime: provided.al2
-      Handler: bootstrap
-      Architectures: [x86_64]
-      Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Ref LambdaArtifactKey
+      Runtime: provided.al2023
+      Handler: chat
+      CodeUri: backend/build/
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /chat
+            Method: POST
+            RestApiId:
+              Ref: Endpoints
       Environment:
         Variables:
           POLLY_VOICE: !Ref PollyVoice
 
   # -------------------- API Gateway (HTTP API) --------------------
-  HttpApi:
-    Type: AWS::ApiGatewayV2::Api
-    Properties:
-      Name: !Sub ${ProjectName}-api
-      ProtocolType: HTTP
-      CorsConfiguration:
-        AllowMethods: [GET, POST]
-        AllowOrigins: ['*']
-        AllowHeaders: ['content-type']
 
-  ChatIntegration:
-    Type: AWS::ApiGatewayV2::Integration
+  Endpoints:
+    Type: AWS::Serverless::Api
     Properties:
-      ApiId: !Ref HttpApi
-      IntegrationType: AWS_PROXY
-      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatFunction.Arn}/invocations
-      PayloadFormatVersion: '2.0'
-
-  RouteHealth:
-    Type: AWS::ApiGatewayV2::Route
-    Properties:
-      ApiId: !Ref HttpApi
-      RouteKey: 'GET /health'
-      Target: !Sub integrations/${ChatIntegration}
-
-  RouteChat:
-    Type: AWS::ApiGatewayV2::Route
-    Properties:
-      ApiId: !Ref HttpApi
-      RouteKey: 'POST /chat'
-      Target: !Sub integrations/${ChatIntegration}
-
-  ApiStage:
-    Type: AWS::ApiGatewayV2::Stage
-    Properties:
-      ApiId: !Ref HttpApi
-      StageName: '$default'
-      AutoDeploy: true
-
-  LambdaInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref ChatFunction
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*
+      StageName: Latest
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'Content-Type,Authorization,X-Requested-With'"
+        AllowMethods: "'GET,POST,OPTIONS'"
+      DefinitionBody:
+        swagger: 2.0
+        info:
+          title:
+            Ref: AWS::StackName
+        paths:
+          /health:
+            get:
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HealthFunction.Arn}/invocations
+              responses: {}
+          /chat:
+            post:
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatFunction.Arn}/invocations
+              responses: {}
 
   # -------------------- S3 bucket for SPA --------------------
   WebsiteBucket:
@@ -177,7 +153,7 @@ Resources:
 
 Outputs:
   APIBaseUrl:
-    Value: !GetAtt HttpApi.ApiEndpoint
+    Value: !Sub "https://${Endpoints}.execute-api.${AWS::Region}.amazonaws.com/Latest"
   WebsiteBucket:
     Value: !Ref WebsiteBucket
   CloudFrontDistributionId:

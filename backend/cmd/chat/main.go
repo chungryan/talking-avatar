@@ -11,6 +11,7 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/chungryan/talking-avatar/backend/pkg/helpers"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -45,30 +46,20 @@ func main() {
 	lambda.Start(handler)
 }
 
-func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
-	switch req.RawPath {
-	case "/health":
-		return ok(map[string]any{"ok": true})
-	case "/chat":
-		if req.RequestContext.HTTP.Method != "POST" {
-			return clientErr(405, "method not allowed")
-		}
-		var cr chatRequest
-		if err := json.Unmarshal([]byte(req.Body), &cr); err != nil {
-			return clientErr(400, "bad json")
-		}
-
-		reply := generateReplyTextStub(cr.UserText)
-
-		audioB64, marks, err := synthesizeWithPolly(ctx, reply)
-		if err != nil {
-			return serverErr(err)
-		}
-
-		return ok(chatResponse{ReplyText: reply, AudioBase64: audioB64, Visemes: marks})
-	default:
-		return clientErr(404, "not found")
+func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	var cr chatRequest
+	if err := json.Unmarshal([]byte(req.Body), &cr); err != nil {
+		return helpers.Nok(400, "bad json")
 	}
+
+	reply := generateReplyTextStub(cr.UserText)
+
+	audioB64, marks, err := synthesizeWithPolly(ctx, reply)
+	if err != nil {
+		return helpers.Nok(500, err.Error())
+	}
+
+	return helpers.Ok(chatResponse{ReplyText: reply, AudioBase64: audioB64, Visemes: marks})
 }
 
 func generateReplyTextStub(user string) string {
@@ -129,23 +120,4 @@ func synthesizeWithPolly(ctx context.Context, text string) (string, []visemeMark
 	}
 
 	return audioB64, visemes, nil
-}
-
-func ok(v any) (events.APIGatewayV2HTTPResponse, error) {
-	b, _ := json.Marshal(v)
-	return events.APIGatewayV2HTTPResponse{
-		StatusCode: 200,
-		Headers: map[string]string{
-			"Content-Type":                "application/json",
-			"Access-Control-Allow-Origin": "*",
-		},
-		Body: string(b),
-	}, nil
-}
-
-func clientErr(code int, msg string) (events.APIGatewayV2HTTPResponse, error) {
-	return events.APIGatewayV2HTTPResponse{StatusCode: code, Body: msg, Headers: map[string]string{"Access-Control-Allow-Origin": "*"}}, nil
-}
-func serverErr(err error) (events.APIGatewayV2HTTPResponse, error) {
-	return events.APIGatewayV2HTTPResponse{StatusCode: 500, Body: err.Error(), Headers: map[string]string{"Access-Control-Allow-Origin": "*"}}, nil
 }

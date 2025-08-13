@@ -5,8 +5,10 @@ frontend/.env
 
 # Go
 backend/lambda.zip
-backend/bootstrap
+backend/build
 backend/bin
+backend/c.out
 
 # OS
 .DS_Store
+packaged.yml
