@@ -46,6 +46,12 @@ Resources:
       Environment:
         Variables:
           POLLY_VOICE: !Ref PollyVoice
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - polly:SynthesizeSpeech
+              Resource: "*"
 
   # -------------------- API Gateway (HTTP API) --------------------
 
