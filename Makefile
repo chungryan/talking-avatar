@@ -33,10 +33,7 @@ deploy: package
 		--region ap-southeast-2 \
 		--template-file packaged.yml \
 		--stack-name ${PROJECT_NAME} \
-		--capabilities CAPABILITY_IAM \
-		--parameter-overrides \
-			ProjectName=${PROJECT_NAME} \
-			PollyVoice=Joanna
+		--capabilities CAPABILITY_NAMED_IAM
 
 publish: clean build package deploy
 

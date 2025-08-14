@@ -9,6 +9,11 @@ backend/build
 backend/bin
 backend/c.out
 
+# Renderer
+renderer/.py311
+renderer/node_modules
+renderer/dist
+
 # OS
 .DS_Store
 packaged.yml
