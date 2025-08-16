@@ -11,7 +11,7 @@ Parameters:
     Default: Joanna
   RendererImageUri:
     Type: String
-    Default: 775204092163.dkr.ecr.ap-southeast-2.amazonaws.com/talking-avatar-renderer:ts-render
+    Default: 775204092163.dkr.ecr.ap-southeast-2.amazonaws.com/talking-avatar-renderer:0.0.2
     Description: ECR image URI
   RenderWidth:
     Type: String
