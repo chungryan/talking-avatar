@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+# For CPU: comment CUDA wheels in requirements.txt and install CPU torch/torchaudio/torchvision instead.
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+COPY models /models
+ENV WAV2LIP_WEIGHTS=/models/wav2lip.pth
+
+COPY third_party/wav2lip/ third_party/wav2lip/
+COPY app.py audio.py lip_sync.py s3util.py ./
+
+EXPOSE 8000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

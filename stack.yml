@@ -34,6 +34,41 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true","false"]
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-d83278bd
+  PublicSubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-cb3d06ae
+  PublicSubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-9380bed5
+  AnimatorImageUri:
+    Type: String
+    Default: 775204092163.dkr.ecr.ap-southeast-2.amazonaws.com/talking-avatar-animator:0.0.1
+  InstanceType:
+    Type: String
+    Default: g6f.2xlarge
+    AllowedValues:
+      - g6f.xlarge
+      - g6f.2xlarge
+      - g6f.4xlarge
+      - g6.xlarge
+      - g5.xlarge
+  UbuntuAmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-0e7a5785ab62399cb
+  ContainerPort:
+    Type: Number
+    Default: 8000
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 3
+  Timezone:
+    Type: String
+    Default: Australia/Sydney
 
 Resources:
   # -------------------- Lambda Function --------------------
@@ -255,6 +290,252 @@ Resources:
         HealthyThreshold: 1
         UnhealthyThreshold: 5
 
+  # -------------------- Animator --------------------
+
+  AnimatorALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ProjectName}-animator-alb-sg
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: HTTP from anywhere (demo)
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  AnimatorEC2SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ProjectName}-animator-ec2-sg
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: ALB to container
+          IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AnimatorALBSG
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  AnimatorALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-animator-alb
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetId1, !Ref PublicSubnetId2]
+      SecurityGroups: [!Ref AnimatorALBSG]
+
+  AnimatorTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-animator-tg
+      TargetType: instance
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: '200'
+
+  AnimatorALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AnimatorALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AnimatorTG
+
+  AnimatorInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-animator-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: AnimatorEC2Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ECRPull
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeImages
+                Resource: "*"
+              - Sid: S3ReadAssets
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub ${AssetsBucket.Arn}/*
+              - Sid: S3ReadEc2LinuxNvidiaDrivers
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - arn:aws:s3:::ec2-linux-nvidia-drivers
+                  - arn:aws:s3:::ec2-linux-nvidia-drivers/*
+              - Sid: CWLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  AnimatorInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AnimatorInstanceRole]
+
+  AnimatorLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-animator-lt
+      LaunchTemplateData:
+        ImageId: !Ref UbuntuAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt AnimatorInstanceProfile.Arn
+        MetadataOptions:
+          HttpTokens: required
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs: { VolumeSize: 200, VolumeType: gp3, DeleteOnTermination: true }
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref AnimatorEC2SG
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+            REGION=${AWS::Region}
+            ACCOUNT_ID=${AWS::AccountId}
+            IMAGE_URI='${AnimatorImageUri}'
+            PORT='${ContainerPort}'
+
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y awscli build-essential dkms linux-headers-$(uname -r) ca-certificates curl gnupg jq
+
+            # Blacklist nouveau and rebuild initramfs; reboot once (ensures clean driver bind)
+            echo "blacklist nouveau" > /etc/modprobe.d/blacklist-nouveau.conf
+            echo "options nouveau modeset=0" >> /etc/modprobe.d/blacklist-nouveau.conf
+            update-initramfs -u
+
+            # Write post-reboot provisioner
+            install -d -m 0755 /opt/animator
+            cat >/opt/animator/provision.sh <<'SCRIPT'
+            #!/bin/bash -xe
+            exec > >(tee -a /var/log/post-provision.log) 2>&1
+
+            REGION='${AWS::Region}'
+            ACCOUNT_ID='${AWS::AccountId}'
+            IMAGE_URI='${AnimatorImageUri}'
+            PORT='${ContainerPort}'
+
+            # --- Install GRID (vGPU) driver (required for G6f) ---
+            mkdir -p /tmp/nvidia-grid && cd /tmp/nvidia-grid
+            aws s3 cp --recursive s3://ec2-linux-nvidia-drivers/latest/ .
+            chmod +x NVIDIA-Linux-x86_64-*-grid-aws.run
+            sh ./NVIDIA-Linux-x86_64-*-grid-aws.run -s --no-cc-version-check
+            modprobe nvidia || true
+            nvidia-smi || { echo "nvidia-smi failed"; tail -n 200 /var/log/nvidia-installer.log || true; dmesg | tail -n 200 || true; exit 1; }
+
+            # --- NVIDIA Container Toolkit + Docker ---
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit.gpg
+            curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+              | sed 's#deb https://#deb [signed-by=/etc/apt/keyrings/nvidia-container-toolkit.gpg] https://#' \
+              | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+            apt-get update
+            apt-get install -y docker.io nvidia-container-toolkit
+            nvidia-ctk runtime configure --runtime=docker
+            systemctl enable --now docker
+            systemctl restart docker
+
+            # --- ECR login & systemd unit for animator ---
+            aws ecr get-login-password --region $REGION \
+              | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
+
+            cat >/etc/systemd/system/animator.service <<UNIT
+            [Unit]
+            Description=Animator GPU service
+            After=docker.service
+            Requires=docker.service
+
+            [Service]
+            Restart=always
+            RestartSec=5
+            Environment=PORT=$PORT
+            ExecStart=/usr/bin/docker run --rm --gpus all --name animator -p $PORT:$PORT \
+              -e AWS_REGION=$REGION \
+              $IMAGE_URI
+            ExecStop=/usr/bin/docker stop animator
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            systemctl daemon-reload
+            systemctl enable --now animator.service
+            SCRIPT
+            chmod +x /opt/animator/provision.sh
+
+            # One-shot unit to run after reboot
+            cat >/etc/systemd/system/post-reboot-provision.service <<'UNIT'
+            [Unit]
+            Description=Post-reboot provision (GRID driver, container runtime, animator)
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=oneshot
+            ExecStart=/opt/animator/provision.sh
+            RemainAfterExit=no
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            systemctl enable post-reboot-provision.service
+
+            # Reboot to apply nouveau blacklist and finish provisioning
+            (sleep 3; reboot) &
+
+  AnimatorASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [!Ref PublicSubnetId1, !Ref PublicSubnetId2]
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: !Ref DesiredCapacity
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AnimatorLaunchTemplate
+        Version: !GetAtt AnimatorLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref AnimatorTG]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-animator
+          PropagateAtLaunch: true
+
   # -------------------- S3 bucket for assets --------------------
 
   AssetsBucket:
@@ -388,4 +669,6 @@ Outputs:
     Value: !GetAtt RendererService.ServiceArn
   RendererServiceUrl:
     Value: !GetAtt RendererService.ServiceUrl
-
+  AnimatorURL:
+    Description: Public URL of the Animator service (HTTP)
+    Value: !Sub http://${AnimatorALB.DNSName}

@@ -63,3 +63,8 @@ cd frontend && npm i && npm run dev
 - The Lambda artifact upload uses an *existing* S3 bucket you control for artifacts (not created by the stack). Pass its name to the script.
 - The stack outputs `APIBaseUrl`, `WebsiteBucket`, and `CloudFrontDomainName`.
 - To redeploy new Lambda code: rerun step 1 with same key, then run `aws cloudformation deploy` again (no changes to template required).
+
+
+## Animator
+
+Load wav2lip model from assets bucket /models/wav2lip.pth and put it in /animator/models/wav2lip.pth

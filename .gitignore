@@ -17,3 +17,6 @@ renderer/dist
 # OS
 .DS_Store
 packaged.yml
+
+# Animator
+animator/models
