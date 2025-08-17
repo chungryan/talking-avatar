@@ -1,51 +1,75 @@
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-import numpy as np
+# app.py (only the handler & glue shown)
+import asyncio, io, os
+import boto3, numpy as np
+from fastapi import FastAPI, Query, Response
+from starlette.responses import StreamingResponse
+from turbojpeg import TurboJPEG
 
-from s3util import load_avatar_rgb
-from audio import decode_audio_base64_to_pcm16
-from lip_sync import choose_mjpeg_generator
+from s3util import load_avatar_rgb, get_bytes
+from lip_sync import prepare_avatar_tensor, pcm_wav_to_mels, run_wav2lip_stream
 
 app = FastAPI()
+jpeg = TurboJPEG()
+s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION"))
+avatar_cache = {}  # small LRU in your code
 
-class RenderReq(BaseModel):
-    bucket: str
-    avatarKey: str
-    audioBase64: str | None = None
-    width: int = 512
-    height: int = 512
-    fps: int = 15
-    useAI: bool = True
+def encode_jpeg(img_uint8):
+  return jpeg.encode(img_uint8, quality=80, chroma_subsampling=jpeg.TJSAMP_420)
+
+def placeholder(w, h, text="loading…"):
+  # simple black frame to flush early
+  arr = np.zeros((h, w, 3), dtype=np.uint8)
+  return arr
 
 @app.get("/")
-def health(): return {"ok": True}
+def root(): return {"ok": True}
 
-@app.post("/mjpeg")
-def mjpeg(req: RenderReq):
-    w = max(64, min(1920, int(req.width)))
-    h = max(64, min(1080, int(req.height)))
-    fps = max(1, min(30, int(req.fps)))
-    sr = 16000
+@app.get("/mjpeg")
+async def mjpeg(
+  bucket: str = Query(...),
+  avatarKey: str = Query(...),
+  audioKey: str = Query(...),
+  w: int = Query(512),
+  h: int = Query(512),
+  fps: int = Query(15),
+):
+  boundary = "frame"
 
-    base = load_avatar_rgb(req.bucket, req.avatarKey, w, h)
-    pcm = decode_audio_base64_to_pcm16(req.audioBase64, sr) if req.audioBase64 else np.zeros((int(sr*1.5),), dtype=np.float32)
+  async def gen():
+    # 1) early flush
+    yield (f"--{boundary}\r\nContent-Type: image/jpeg\r\n\r\n").encode()
+    yield encode_jpeg(placeholder(w, h))
+    yield b"\r\n"
 
-    gen_fn = choose_mjpeg_generator(bool(req.useAI))
-    boundary = "frame"
+    # 2) fetch inputs concurrently
+    loop = asyncio.get_event_loop()
+    avatar_t = avatar_cache.get((bucket, avatarKey, w, h))
+    if avatar_t is None:
+      avatar_np = await loop.run_in_executor(None, load_avatar_rgb, bucket, avatarKey, w, h)
+      avatar_t = prepare_avatar_tensor(avatar_np)  # torch tensor on GPU
+      avatar_cache[(bucket, avatarKey, w, h)] = avatar_t
 
-    def body():
-        for jpg in gen_fn(base, pcm, sr, fps):
-            yield (f"--{boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(jpg)}\r\n\r\n").encode()
-            yield jpg
-            yield b"\r\n"
+    audio_bytes = await loop.run_in_executor(None, get_bytes, bucket, audioKey)
+    mels = await loop.run_in_executor(None, pcm_wav_to_mels, audio_bytes)  # torch tensor on GPU
 
-    headers = {
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-        "Content-Type": f"multipart/x-mixed-replace; boundary={boundary}"
-    }
-    return StreamingResponse(body(), headers=headers, media_type=f"multipart/x-mixed-replace; boundary={boundary}")
+    # 3) stream frames paced at fps
+    interval = 1.0 / max(1, fps)
+    start = loop.time()
+    i = 0
+    for frame in run_wav2lip_stream(avatar_t, mels, w, h):
+      target = start + i * interval; i += 1
+      now = loop.time()
+      if target > now:
+        await asyncio.sleep(target - now)
+      yield (f"--{boundary}\r\nContent-Type: image/jpeg\r\n\r\n").encode()
+      yield encode_jpeg(frame)   # np.uint8 HxWx3
+      yield b"\r\n"
+
+    yield f"--{boundary}--\r\n".encode()
+
+  headers = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+    "Access-Control-Allow-Origin": "*",
+  }
+  return StreamingResponse(gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}", headers=headers)

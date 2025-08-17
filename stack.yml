@@ -9,31 +9,6 @@ Parameters:
   PollyVoice:
     Type: String
     Default: Joanna
-  RendererImageUri:
-    Type: String
-    Default: 775204092163.dkr.ecr.ap-southeast-2.amazonaws.com/talking-avatar-renderer:0.0.2
-    Description: ECR image URI
-  RenderWidth:
-    Type: String
-    Default: "512"
-  RenderHeight:
-    Type: String
-    Default: "512"
-  RenderFps:
-    Type: String
-    Default: "15"
-  RendererCpu:
-    Type: String
-    Default: "1 vCPU"
-    AllowedValues: ["1 vCPU","2 vCPU","4 vCPU"]
-  RendererMemory:
-    Type: String
-    Default: "2 GB"
-    AllowedValues: ["2 GB","3 GB","4 GB","8 GB"]
-  AutoDeploymentsEnabled:
-    Type: String
-    Default: "true"
-    AllowedValues: ["true","false"]
   VpcId:
     Type: AWS::EC2::VPC::Id
     Default: vpc-d83278bd
@@ -45,16 +20,7 @@ Parameters:
     Default: subnet-9380bed5
   AnimatorImageUri:
     Type: String
-    Default: 775204092163.dkr.ecr.ap-southeast-2.amazonaws.com/talking-avatar-animator:0.0.1
-  InstanceType:
-    Type: String
-    Default: g6f.2xlarge
-    AllowedValues:
-      - g6f.xlarge
-      - g6f.2xlarge
-      - g6f.4xlarge
-      - g6.xlarge
-      - g5.xlarge
+    Default: 775204092163.dkr.ecr.ap-southeast-2.amazonaws.com/talking-avatar-animator:0.0.3
   UbuntuAmiId:
     Type: AWS::EC2::Image::Id
     Default: ami-0e7a5785ab62399cb
@@ -106,12 +72,17 @@ Resources:
       Environment:
         Variables:
           POLLY_VOICE: !Ref PollyVoice
+          ASSETS_BUCKET: !Ref AssetsBucket
       Policies:
         - Statement:
           - Effect: Allow
             Action:
               - polly:SynthesizeSpeech
             Resource: "*"
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource: !Sub ${AssetsBucket.Arn}/*
 
   UploadUrlFunction:
     Type: AWS::Serverless::Function
@@ -220,76 +191,6 @@ Resources:
                 uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AvatarFunction.Arn}/invocations
               responses: {}
 
-  # -------------------- Renderer --------------------
-
-  RendererECRAccessRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub ${ProjectName}-ecr-role
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: { Service: build.apprunner.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
-
-  RendererInstanceRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub ${ProjectName}-instance-role
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: { Service: tasks.apprunner.amazonaws.com }
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: S3ReadAssets
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: s3:GetObject
-                Resource: !Sub ${AssetsBucket.Arn}/*
-
-  RendererService:
-    Type: AWS::AppRunner::Service
-    Properties:
-      ServiceName: !Sub ${ProjectName}-renderer
-      SourceConfiguration:
-        ImageRepository:
-          ImageIdentifier: !Ref RendererImageUri
-          ImageRepositoryType: ECR
-          ImageConfiguration:
-            Port: '8080'
-            RuntimeEnvironmentVariables:
-              - Name: NODE_ENV
-                Value: production
-              - Name: ASSETS_BUCKET
-                Value: !Ref AssetsBucket
-              - Name: WIDTH
-                Value: !Ref RenderWidth
-              - Name: HEIGHT
-                Value: !Ref RenderHeight
-              - Name: FPS
-                Value: !Ref RenderFps
-        AuthenticationConfiguration:
-          AccessRoleArn: !GetAtt RendererECRAccessRole.Arn
-        AutoDeploymentsEnabled: !Ref AutoDeploymentsEnabled
-      InstanceConfiguration:
-        Cpu: !Ref RendererCpu
-        Memory: !Ref RendererMemory
-        InstanceRoleArn: !GetAtt RendererInstanceRole.Arn
-      HealthCheckConfiguration:
-        Protocol: HTTP
-        Path: /
-        Interval: 10
-        Timeout: 5
-        HealthyThreshold: 1
-        UnhealthyThreshold: 5
-
   # -------------------- Animator --------------------
 
   AnimatorALBSG:
@@ -375,6 +276,7 @@ Resources:
                   - ecr:BatchGetImage
                   - ecr:GetDownloadUrlForLayer
                   - ecr:DescribeImages
+                  - ecr:BatchCheckLayerAvailability
                 Resource: "*"
               - Sid: S3ReadAssets
                 Effect: Allow
@@ -406,9 +308,10 @@ Resources:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateName: !Sub ${AWS::StackName}-animator-lt
+      VersionDescription: g6.2xlarge instance type v8
       LaunchTemplateData:
         ImageId: !Ref UbuntuAmiId
-        InstanceType: !Ref InstanceType
+        InstanceType: g6.2xlarge
         IamInstanceProfile:
           Arn: !GetAtt AnimatorInstanceProfile.Arn
         MetadataOptions:
@@ -423,102 +326,80 @@ Resources:
               - !Ref AnimatorEC2SG
         UserData:
           Fn::Base64: !Sub |
-            #!/bin/bash -xe
-            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+            #!/usr/bin/env bash
+            # SALT v8
+            set -euxo pipefail
+            exec > >(tee -a /var/log/user-data.log) 2>&1
 
-            REGION=${AWS::Region}
-            ACCOUNT_ID=${AWS::AccountId}
-            IMAGE_URI='${AnimatorImageUri}'
-            PORT='${ContainerPort}'
-
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y awscli build-essential dkms linux-headers-$(uname -r) ca-certificates curl gnupg jq
-
-            # Blacklist nouveau and rebuild initramfs; reboot once (ensures clean driver bind)
-            echo "blacklist nouveau" > /etc/modprobe.d/blacklist-nouveau.conf
-            echo "options nouveau modeset=0" >> /etc/modprobe.d/blacklist-nouveau.conf
-            update-initramfs -u
-
-            # Write post-reboot provisioner
-            install -d -m 0755 /opt/animator
-            cat >/opt/animator/provision.sh <<'SCRIPT'
-            #!/bin/bash -xe
-            exec > >(tee -a /var/log/post-provision.log) 2>&1
-
+            APP_PORT='${ContainerPort}'
+            IMAGE_URI='775204092163.dkr.ecr.ap-southeast-2.amazonaws.com/talking-avatar-animator:0.0.4'
             REGION='${AWS::Region}'
-            ACCOUNT_ID='${AWS::AccountId}'
-            IMAGE_URI='${AnimatorImageUri}'
-            PORT='${ContainerPort}'
 
-            # --- Install GRID (vGPU) driver (required for G6f) ---
-            mkdir -p /tmp/nvidia-grid && cd /tmp/nvidia-grid
-            aws s3 cp --recursive s3://ec2-linux-nvidia-drivers/latest/ .
-            chmod +x NVIDIA-Linux-x86_64-*-grid-aws.run
-            sh ./NVIDIA-Linux-x86_64-*-grid-aws.run -s --no-cc-version-check
-            modprobe nvidia || true
-            nvidia-smi || { echo "nvidia-smi failed"; tail -n 200 /var/log/nvidia-installer.log || true; dmesg | tail -n 200 || true; exit 1; }
-
-            # --- NVIDIA Container Toolkit + Docker ---
-            install -m 0755 -d /etc/apt/keyrings
-            curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit.gpg
-            curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-              | sed 's#deb https://#deb [signed-by=/etc/apt/keyrings/nvidia-container-toolkit.gpg] https://#' \
-              | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+            echo "== Stage 0: base packages =="
             apt-get update
-            apt-get install -y docker.io nvidia-container-toolkit
-            nvidia-ctk runtime configure --runtime=docker
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              curl ca-certificates gnupg lsb-release unzip \
+              docker.io
+
+            echo "== Stage 1: NVIDIA driver (≥550) =="
+            # Try 570, fall back to 560/550, then autoinstall if needed
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-570; then
+              if ! DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-560; then
+                if ! DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-driver-550; then
+                  ubuntu-drivers autoinstall || true
+                fi
+              fi
+            fi
+            # Attempt to load module without reboot
+            modprobe nvidia || true
+
+            echo "== Stage 2: NVIDIA container toolkit =="
+            # Add NVIDIA libnvidia-container repo
+            curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+              gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+            curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+              sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' | \
+              tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit
+
+            # Set default Docker runtime to nvidia (via nvidia-ctk)
+            nvidia-ctk runtime configure --runtime=docker --set-as-default
             systemctl enable --now docker
             systemctl restart docker
 
-            # --- ECR login & systemd unit for animator ---
-            aws ecr get-login-password --region $REGION \
-              | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
+            echo "== Stage 3: Sanity checks =="
+            nvidia-smi || true
+            docker run --rm --gpus all nvidia/cuda:12.3.2-runtime-ubuntu22.04 nvidia-smi || true
 
-            cat >/etc/systemd/system/animator.service <<UNIT
-            [Unit]
-            Description=Animator GPU service
-            After=docker.service
-            Requires=docker.service
+            echo "== Stage 4: AWS CLI v2 =="
+            curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            /tmp/aws/install -i /usr/local/aws-cli -b /usr/local/bin
+            aws --version
 
-            [Service]
-            Restart=always
-            RestartSec=5
-            Environment=PORT=$PORT
-            ExecStart=/usr/bin/docker run --rm --gpus all --name animator -p $PORT:$PORT \
-              -e AWS_REGION=$REGION \
-              $IMAGE_URI
-            ExecStop=/usr/bin/docker stop animator
+            echo "== Stage 5: ECR login & run animator =="
+            ECR_HOST="$(echo "$IMAGE_URI" | awk -F/ '{print $1}')"
+            aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_HOST"
 
-            [Install]
-            WantedBy=multi-user.target
-            UNIT
+            docker pull "$IMAGE_URI" || (sleep 5 && docker pull "$IMAGE_URI")
+            docker rm -f animator || true
+            docker run -d --name animator --restart=always --gpus all \
+              -e AWS_REGION="$REGION" \
+              -e PORT="$APP_PORT" \
+              -p $APP_PORT:$APP_PORT \
+              "$IMAGE_URI"
 
-            systemctl daemon-reload
-            systemctl enable --now animator.service
-            SCRIPT
-            chmod +x /opt/animator/provision.sh
-
-            # One-shot unit to run after reboot
-            cat >/etc/systemd/system/post-reboot-provision.service <<'UNIT'
-            [Unit]
-            Description=Post-reboot provision (GRID driver, container runtime, animator)
-            After=network-online.target
-            Wants=network-online.target
-
-            [Service]
-            Type=oneshot
-            ExecStart=/opt/animator/provision.sh
-            RemainAfterExit=no
-
-            [Install]
-            WantedBy=multi-user.target
-            UNIT
-
-            systemctl enable post-reboot-provision.service
-
-            # Reboot to apply nouveau blacklist and finish provisioning
-            (sleep 3; reboot) &
+            echo "== Stage 6: Health check =="
+            for i in {1..60}; do
+              if curl -fsS "http://127.0.0.1:$APP_PORT/" >/dev/null; then
+                echo "Animator up"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "Animator failed to start"
+            exit 1
 
   AnimatorASG:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -665,10 +546,6 @@ Outputs:
     Value: !Ref CloudFrontDistribution
   CloudFrontDomainName:
     Value: !GetAtt CloudFrontDistribution.DomainName
-  RendererServiceArn:
-    Value: !GetAtt RendererService.ServiceArn
-  RendererServiceUrl:
-    Value: !GetAtt RendererService.ServiceUrl
   AnimatorURL:
     Description: Public URL of the Animator service (HTTP)
     Value: !Sub http://${AnimatorALB.DNSName}

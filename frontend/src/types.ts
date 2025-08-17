@@ -13,8 +13,8 @@ export type AvatarGenerateResponse = {
 
 export type ChatResponse = {
   replyText: string
-  audioBase64: string // MP3 base64
-  visemes: Viseme[]
+  audioKey: string
+  audioUrl: string // for local playback
 }
 
 export type RenderStartResponse = {

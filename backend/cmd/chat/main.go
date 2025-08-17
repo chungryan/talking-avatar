@@ -1,123 +1,155 @@
+// go.mod should stay on go1.20; use aws-sdk-go v1.x per your constraints.
 package main
 
 import (
-	"context"
-	"encoding/base64"
+	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
+	"log"
+	"math/rand"
 	"os"
+	"path"
+	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/chungryan/talking-avatar/backend/pkg/helpers"
-
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
-	polly "github.com/aws/aws-sdk-go/service/polly"
+	"github.com/aws/aws-sdk-go/service/polly"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/chungryan/talking-avatar/backend/pkg/helpers"
 )
 
-type chatRequest struct {
+var (
+	sess      *session.Session
+	pollySvc  *polly.Polly
+	s3Svc     *s3.S3
+	bucket    = os.Getenv("ASSETS_BUCKET") // set in CFN env for your API
+	voiceID   = os.Getenv("POLLY_VOICE")   // e.g. "Joanna"
+	urlExpiry = 15 * time.Minute
+)
+
+type chatReq struct {
 	UserText string `json:"userText"`
 }
 
-type visemeMark struct {
-	TimeMS int64  `json:"timeMs"`
-	Type   string `json:"type"`
+type chatResp struct {
+	ReplyText string `json:"replyText"`
+	AudioKey  string `json:"audioKey"`
+	AudioURL  string `json:"audioUrl"` // presigned for playback
+	// Optional: include visemes if you still use them elsewhere
 }
 
-type chatResponse struct {
-	ReplyText   string       `json:"replyText"`
-	AudioBase64 string       `json:"audioBase64"`
-	Visemes     []visemeMark `json:"visemes"`
+func init() {
+	sess = session.Must(session.NewSession(&aws.Config{}))
+	// assume role if needed:
+	_ = stscreds.NewCredentials(sess, "")
+	pollySvc = polly.New(sess)
+	s3Svc = s3.New(sess)
+	rand.Seed(time.Now().UnixNano())
 }
 
-var pollyClient *polly.Polly
-var voiceID = os.Getenv("POLLY_VOICE")
-
-func main() {
-	// Use default credential chain / region from env or rolego mod tidy
-	sess := session.Must(session.NewSession(&aws.Config{}))
-	pollyClient = polly.New(sess)
-	if voiceID == "" {
-		voiceID = "Joanna"
+func synthToPCM16k(text string) ([]byte, error) {
+	// PCM bytes (no container)
+	out, err := pollySvc.SynthesizeSpeech(&polly.SynthesizeSpeechInput{
+		OutputFormat: aws.String("pcm"),
+		SampleRate:   aws.String("16000"),
+		Text:         aws.String(text),
+		VoiceId:      aws.String(voiceID),
+		Engine:       aws.String("neural"), // or standard if voice unsupported
+	})
+	if err != nil {
+		return nil, err
 	}
-	lambda.Start(handler)
+	defer out.AudioStream.Close()
+	var buf bytes.Buffer
+	_, err = buf.ReadFrom(out.AudioStream)
+	return buf.Bytes(), err
 }
 
-func handler(ctx context.Context, req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	var cr chatRequest
-	if err := json.Unmarshal([]byte(req.Body), &cr); err != nil {
+func wavWrapPCM16mono16k(pcm []byte) []byte {
+	// Minimal WAV header for PCM 16k mono 16-bit
+	byteRate := uint32(16000 * 2)
+	blockAlign := uint16(2)
+	dataLen := uint32(len(pcm))
+	riffLen := 36 + dataLen
+
+	var h bytes.Buffer
+	// RIFF
+	h.WriteString("RIFF")
+	writeU32(&h, riffLen)
+	h.WriteString("WAVE")
+	// fmt chunk
+	h.WriteString("fmt ")
+	writeU32(&h, 16)         // PCM header size
+	writeU16(&h, 1)          // PCM format
+	writeU16(&h, 1)          // mono
+	writeU32(&h, 16000)      // sample rate
+	writeU32(&h, byteRate)   // byte rate
+	writeU16(&h, blockAlign) // block align
+	writeU16(&h, 16)         // bits per sample
+	// data chunk
+	h.WriteString("data")
+	writeU32(&h, dataLen)
+	h.Write(pcm)
+	return h.Bytes()
+}
+
+func writeU16(b *bytes.Buffer, v uint16) { b.Write([]byte{byte(v), byte(v >> 8)}) }
+func writeU32(b *bytes.Buffer, v uint32) {
+	b.Write([]byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)})
+}
+
+func handle(req events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	var in chatReq
+	if err := json.Unmarshal([]byte(req.Body), &in); err != nil {
 		return helpers.Nok(400, "bad json")
 	}
-
-	reply := generateReplyTextStub(cr.UserText)
-
-	audioB64, marks, err := synthesizeWithPolly(ctx, reply)
+	reply := generateReply(in.UserText) // your logic / LLM
+	pcm, err := synthToPCM16k(reply)
 	if err != nil {
-		return helpers.Nok(500, err.Error())
+		log.Println("polly synth err:", err)
+		return helpers.Nok(502, "polly synth failed")
 	}
+	wav := wavWrapPCM16mono16k(pcm)
 
-	return helpers.Ok(chatResponse{ReplyText: reply, AudioBase64: audioB64, Visemes: marks})
-}
+	// s3 key
+	key := path.Join("audio", time.Now().Format("20060102-150405"),
+		fmt.Sprintf("%08x.wav", rand.Uint32()))
 
-func generateReplyTextStub(user string) string {
-	if user == "" {
-		return "Hello! What would you like to talk about?"
-	}
-	return fmt.Sprintf("You said: %s. Here's a friendly response from your avatar!", user)
-}
-
-func synthesizeWithPolly(ctx context.Context, text string) (string, []visemeMark, error) {
-	// Audio (mp3)
-	audioOut, err := pollyClient.SynthesizeSpeechWithContext(ctx, &polly.SynthesizeSpeechInput{
-		Text:         aws.String(text),
-		OutputFormat: aws.String("mp3"),
-		VoiceId:      aws.String(voiceID),
+	_, err = s3Svc.PutObject(&s3.PutObjectInput{
+		Bucket:               aws.String(bucket),
+		Key:                  aws.String(key),
+		Body:                 bytes.NewReader(wav),
+		ContentType:          aws.String("audio/wav"),
+		ContentDisposition:   aws.String("inline"),
+		ServerSideEncryption: aws.String("AES256"),
 	})
 	if err != nil {
-		return "", nil, err
+		log.Println("s3 put err:", err)
+		return helpers.Nok(502, "s3 put failed")
 	}
-	defer audioOut.AudioStream.Close()
-	audioBytes, _ := io.ReadAll(audioOut.AudioStream)
-	audioB64 := base64.StdEncoding.EncodeToString(audioBytes)
 
-	// Speech marks (viseme)
-	marksOut, err := pollyClient.SynthesizeSpeechWithContext(ctx, &polly.SynthesizeSpeechInput{
-		Text:            aws.String(text),
-		OutputFormat:    aws.String("json"),
-		SpeechMarkTypes: []*string{aws.String("viseme")},
-		VoiceId:         aws.String(voiceID),
+	// presign for browser playback
+	reqGet, _ := s3Svc.GetObjectRequest(&s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
 	})
-	if err != nil {
-		return "", nil, err
-	}
-	defer marksOut.AudioStream.Close()
+	urlStr, _ := reqGet.Presign(urlExpiry)
 
-	dec := json.NewDecoder(marksOut.AudioStream)
-	var visemes []visemeMark
-	for dec.More() {
-		var line map[string]any
-		if err := dec.Decode(&line); err != nil {
-			break
-		}
-		if t, _ := line["type"].(string); t != "viseme" {
-			continue
-		}
-		v, _ := line["value"].(string)
-		var tms int64
-		switch tv := line["time"].(type) {
-		case float64:
-			tms = int64(tv)
-		case int64:
-			tms = tv
-		}
-		visemes = append(visemes, visemeMark{TimeMS: tms, Type: v})
+	out := chatResp{
+		ReplyText: reply,
+		AudioKey:  key,
+		AudioURL:  urlStr,
 	}
-	if len(visemes) == 0 {
-		return "", nil, errors.New("no visemes from Polly")
-	}
-
-	return audioB64, visemes, nil
+	b, _ := json.Marshal(out)
+	return helpers.OkString(string(b))
 }
+
+func generateReply(user string) string {
+	// minimal stub; replace w/ LLM
+	return "Sure! " + user
+}
+
+func main() { lambda.Start(handle) }
